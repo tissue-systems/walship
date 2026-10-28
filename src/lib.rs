@@ -48,7 +48,7 @@
 //!
 //! The [`Receiver`] and the [`wal`] primitives are always built.
 
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 
 mod error;

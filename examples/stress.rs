@@ -122,6 +122,9 @@ fn main() -> Res<()> {
 
     println!("writer, shipper ({rtt:?} round trip) and replica reader for {secs}s");
     let stop = Arc::new(AtomicBool::new(false));
+    // The shipper stops only after the writer has, so its last catch-up
+    // sees the writer's last commit.
+    let writer_done = Arc::new(AtomicBool::new(false));
     let txns = Arc::new(AtomicU32::new(0));
 
     let writer = {
@@ -147,11 +150,15 @@ fn main() -> Res<()> {
     };
 
     let shipper = {
-        let (stop, rx, path) = (Arc::clone(&stop), Arc::clone(&rx), primary_path.clone());
+        let (done, rx, path) = (
+            Arc::clone(&writer_done),
+            Arc::clone(&rx),
+            primary_path.clone(),
+        );
         thread::spawn(move || -> Res<(u32, u32)> {
             let p = open(&path)?;
             let (mut acked, mut max_lag) = (0, 0);
-            while !stop.load(Ordering::Relaxed) {
+            while !done.load(Ordering::Acquire) {
                 let head = p.head(BUSY_TIMEOUT)?.unwrap_or(acked);
                 assert!(
                     head >= acked,
@@ -191,6 +198,7 @@ fn main() -> Res<()> {
     thread::sleep(Duration::from_secs(secs));
     stop.store(true, Ordering::Relaxed);
     writer.join().expect("writer panicked")?;
+    writer_done.store(true, Ordering::Release);
     let (mut acked, max_lag) = shipper.join().expect("shipper panicked")?;
     let (reads, _) = reader.join().expect("reader panicked")?;
     let elapsed = start.elapsed().as_secs_f64();
