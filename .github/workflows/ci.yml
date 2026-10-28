@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust: [stable, "1.88"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-features
+      - run: cargo run --release --example stress -- "$RUNNER_TEMP/stress" 10 20
+
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --no-default-features
+      - run: cargo check --no-default-features --features shipper
+      - run: cargo check --no-default-features --features server
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      # The check from "Installation" in the README.
+      - name: One SQLite C library in Cargo.lock
+        run: |
+          libs=$(awk '
+            /^\[\[package\]\]/ { name = "" }
+            /^name = / { name = $3 }
+            /^version = / && name ~ /^"(libsql-ffi|libsqlite3-sys)"$/ { print name, $3 }
+          ' Cargo.lock)
+          if [ "$(printf '%s\n' "$libs" | grep -c .)" -gt 1 ]; then
+            echo "more than one SQLite C library in Cargo.lock:"
+            echo "$libs"
+            exit 1
+          fi
+      - run: cargo clippy --all-targets --all-features
+      - run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Follows "Patching the libsql crate" in the README against the published
+  # crate, so the patch and the instructions break together.
+  libsql-patch:
+    runs-on: ubuntu-latest
+    env:
+      # The vendored crate has upstream lint warnings.
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build a project against the patched crate
+        run: |
+          app="$RUNNER_TEMP/app"
+          cargo new -q "$app"
+          cd "$app"
+          cat >> Cargo.toml <<'TOML'
+          libsql = { version = "=0.9.30", default-features = false, features = ["core"] }
+          tokio = { version = "1", features = ["macros", "rt"] }
+          TOML
+          cargo fetch
+          mkdir -p vendor
+          cp -R ~/.cargo/registry/src/index.crates.io-*/libsql-0.9.30 vendor/
+          (cd vendor/libsql-0.9.30 && patch -p1 < "$GITHUB_WORKSPACE/patches/libsql-0.9.30.patch")
+          cat >> Cargo.toml <<'TOML'
+
+          [patch.crates-io]
+          libsql = { path = "vendor/libsql-0.9.30" }
+          TOML
+          cat > src/main.rs <<'RS'
+          #[tokio::main(flavor = "current_thread")]
+          async fn main() {
+              let db = libsql::Builder::new_local("app.db").build().await.unwrap();
+              let conn = db.connect().unwrap();
+              conn.wal_disable_checkpoint().unwrap();
+          }
+          RS
+          cargo run -q

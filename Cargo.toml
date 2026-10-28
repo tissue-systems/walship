@@ -1,0 +1,58 @@
+[package]
+name = "walship"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+authors = ["Tissue Systems, Inc. <oss@tissue.systems>"]
+license = "MIT OR Apache-2.0"
+description = "Ship libSQL WAL frames to a warm replica on another machine"
+repository = "https://github.com/tissue-systems/walship"
+documentation = "https://docs.rs/walship"
+readme = "README.md"
+keywords = ["sqlite", "libsql", "wal", "replication", "failover"]
+categories = ["database"]
+exclude = [".github/"]
+
+[features]
+default = ["shipper", "server"]
+# The sending side: worker threads and an HTTP client.
+shipper = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
+# axum routes for the receiving side. The Receiver itself is always built.
+server = ["dep:axum", "dep:futures-util", "dep:tokio"]
+
+[dependencies]
+libsql-ffi = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+
+axum = { version = "0.8", optional = true }
+futures-util = { version = "0.3", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"], optional = true }
+tokio = { version = "1", features = ["fs", "io-util", "rt"], optional = true }
+tokio-util = { version = "0.7", features = ["io"], optional = true }
+
+[dev-dependencies]
+libc = "0.2"
+libsql = { version = "0.9", default-features = false, features = ["core"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[example]]
+name = "two_nodes"
+required-features = ["shipper", "server"]
+
+[[example]]
+name = "with_libsql"
+required-features = ["shipper", "server"]
+
+[[example]]
+name = "stress"
+
+[[test]]
+name = "shipping"
+required-features = ["shipper", "server"]
+
+[package.metadata.docs.rs]
+all-features = true
