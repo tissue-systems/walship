@@ -789,13 +789,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsql-ffi"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f232292810b6298d17466b59bf8077d075fb016d89c281ca9dc968ea4a3b9d03"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
+ "glob",
+]
+
+[[package]]
 name = "libsql-sys"
 version = "0.9.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90725458cc4461bc82f8f7983e80b002ea4f64b5184e1462f252d0dd74b122f5"
 dependencies = [
  "bytes",
- "libsql-ffi",
+ "libsql-ffi 0.9.30",
  "once_cell",
  "tracing",
  "zerocopy",
@@ -1819,7 +1831,7 @@ dependencies = [
  "futures-util",
  "libc",
  "libsql",
- "libsql-ffi",
+ "libsql-ffi 0.10.0",
  "reqwest",
  "serde",
  "serde_json",
