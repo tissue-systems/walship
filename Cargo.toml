@@ -21,7 +21,7 @@ shipper = ["dep:reqwest", "dep:tokio", "dep:tokio-util"]
 server = ["dep:axum", "dep:futures-util", "dep:tokio"]
 
 [dependencies]
-libsql-ffi = "0.9"
+libsql-ffi = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -34,10 +34,10 @@ tokio = { version = "1", features = ["fs", "io-util", "rt"], optional = true }
 tokio-util = { version = "0.7", features = ["io"], optional = true }
 
 [dev-dependencies]
-libc = "0.2"
-libsql = { version = "0.9", default-features = false, features = ["core"] }
-tokio = { version = "1", features = ["full"] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "=0.2.191"
+libsql = { version = "=0.9.30", default-features = false, features = ["core"] }
+tokio = { version = "=1.54.1", features = ["full"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter"] }
 
 [[example]]
 name = "two_nodes"
