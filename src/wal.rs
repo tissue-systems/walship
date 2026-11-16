@@ -532,6 +532,73 @@ pub fn size_after(frame: &[u8]) -> u32 {
     u32::from_be_bytes(frame[4..8].try_into().unwrap())
 }
 
+/// The page number a frame holds (frame header bytes 0-4).
+///
+/// # Panics
+///
+/// If `frame` is shorter than a frame header.
+#[must_use]
+pub fn page_no(frame: &[u8]) -> u32 {
+    u32::from_be_bytes(frame[0..4].try_into().unwrap())
+}
+
+/// The salt a frame was written under (frame header bytes 8-16). It matches
+/// the salt in the WAL header for every frame of the current log.
+///
+/// # Panics
+///
+/// If `frame` is shorter than a frame header.
+#[must_use]
+pub fn frame_salt(frame: &[u8]) -> [u8; 8] {
+    frame[8..16].try_into().unwrap()
+}
+
+/// The cumulative checksum stored in a frame (frame header bytes 16-24).
+///
+/// # Panics
+///
+/// If `frame` is shorter than a frame header.
+#[must_use]
+pub fn frame_checksum(frame: &[u8]) -> [u32; 2] {
+    [
+        u32::from_be_bytes(frame[16..20].try_into().unwrap()),
+        u32::from_be_bytes(frame[20..24].try_into().unwrap()),
+    ]
+}
+
+/// The checksum SQLite stores in `frame`, given the checksum of the frame
+/// before it: SQLite's `walChecksumBytes` run over the first 8 header bytes
+/// and then the page. `big_endian` is the byte order the WAL header's magic
+/// number picked (`0x377f0683`); SQLite on a little-endian machine writes
+/// `0x377f0682` and little-endian words.
+///
+/// # Panics
+///
+/// If `frame` is shorter than a frame header, or its page isn't a whole
+/// number of 8-byte words (every SQLite page size is).
+#[must_use]
+pub fn chain_checksum(prev: [u32; 2], frame: &[u8], big_endian: bool) -> [u32; 2] {
+    let word = |b: &[u8]| {
+        let b: [u8; 4] = b.try_into().unwrap();
+        if big_endian {
+            u32::from_be_bytes(b)
+        } else {
+            u32::from_le_bytes(b)
+        }
+    };
+    let [mut s1, mut s2] = prev;
+    let page = &frame[FRAME_HEADER..];
+    assert!(
+        page.len().is_multiple_of(8),
+        "page isn't a whole number of words"
+    );
+    for pair in frame[..8].chunks_exact(8).chain(page.chunks_exact(8)) {
+        s1 = s1.wrapping_add(word(&pair[0..4])).wrapping_add(s2);
+        s2 = s2.wrapping_add(word(&pair[4..8])).wrapping_add(s1);
+    }
+    [s1, s2]
+}
+
 /// The salt from a `-wal` file's header. SQLite picks a new salt every time
 /// it restarts the log, so a changed salt means the frame numbers start over.
 ///
