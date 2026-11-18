@@ -592,7 +592,12 @@ pub fn chain_checksum(prev: [u32; 2], frame: &[u8], big_endian: bool) -> [u32; 2
         page.len().is_multiple_of(8),
         "page isn't a whole number of words"
     );
-    for pair in frame[..8].chunks_exact(8).chain(page.chunks_exact(8)) {
+    for pair in frame[..8]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .chain(page.as_chunks::<8>().0)
+    {
         s1 = s1.wrapping_add(word(&pair[0..4])).wrapping_add(s2);
         s2 = s2.wrapping_add(word(&pair[4..8])).wrapping_add(s1);
     }

@@ -314,7 +314,6 @@ impl Receiver {
             return Err(Reject::Bad("frames are numbered from 1".into()));
         }
         let first_frame = &body[..frame_len];
-        let mut big_endian = check_batch(body, frame_len)?;
         let needs_base = |e: Error| Reject::NeedsBase(e.to_string());
         let entry = self.entry(name).map_err(|e| Reject::Bad(e.to_string()))?;
         let mut guard = lock(&entry);
@@ -333,6 +332,23 @@ impl Receiver {
                 "replica page size is {replica_page_size}, batch says {page_size}"
             )));
         }
+        // A batch from a generation before the replica's is never applied, so
+        // it is answered with the replica's position before its frames are
+        // looked at. The shipper reads that as "send a base". It also leaves
+        // an open session alone, since that session belongs to a newer sender.
+        if generation < r.generation {
+            let db = r.db.as_ref().expect("opened above");
+            let frames = match db.head(BUSY_TIMEOUT) {
+                Ok(Some(n)) => n,
+                Ok(None) => return Err(Reject::Busy),
+                Err(e) => return Err(needs_base(e)),
+            };
+            return Err(Reject::Mismatch {
+                generation: r.generation,
+                frames,
+            });
+        }
+        let mut big_endian = check_batch(body, frame_len)?;
         // A batch that picks up right after the last frame applied also has
         // its first frame checked, against that frame.
         if let Some(t) = r

@@ -7,7 +7,9 @@ name a real page, carry the same salt as the rest of the batch, and chain its
 checksum from the frame before it the way SQLite wrote it, and a commit frame
 can't give a database size smaller than a page its transaction wrote. A batch
 that continues the replica is also checked against the last frame applied.
-A failure is a 400 and the replica is left as it was.
+A failure is a 400 and the replica is left as it was. A batch from an older
+generation is still answered with the replica's position, before its frames
+are checked, so the shipper knows to send a base.
 
 When committing a transaction fails partway through a batch, the replica's
 frame count is the last commit that did land, not the one before the batch.
