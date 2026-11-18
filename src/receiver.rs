@@ -65,6 +65,20 @@ struct Replica {
     committed: u32,
     /// A base has been installed.
     present: bool,
+    /// The last frame applied, kept so the next batch's first frame can be
+    /// checked against it. Memory only: after a restart the first batch is
+    /// checked from its second frame on.
+    tail: Option<Tail>,
+}
+
+/// What the receiver remembers about the last frame it applied.
+#[derive(Debug, Clone, Copy)]
+struct Tail {
+    generation: u64,
+    no: u32,
+    salt: [u8; 8],
+    checksum: [u32; 2],
+    big_endian: bool,
 }
 
 /// Where a replica stands.
@@ -192,6 +206,7 @@ impl Receiver {
             pending: None,
             committed: 0,
             present: self.db_path(name).exists(),
+            tail: None,
         }));
         replicas.insert(name.to_owned(), Arc::clone(&replica));
         Ok(replica)
@@ -268,6 +283,7 @@ impl Receiver {
         r.generation = generation;
         r.committed = 0;
         r.present = true;
+        r.tail = None;
         self.save(name, &r)?;
         // Open right away so the -shm exists for read-only readers.
         self.open(name, &mut r)?;
@@ -297,6 +313,7 @@ impl Receiver {
         if first == 0 {
             return Err(Reject::Bad("frames are numbered from 1".into()));
         }
+        let first_frame = &body[..frame_len];
         let needs_base = |e: Error| Reject::NeedsBase(e.to_string());
         let entry = self.entry(name).map_err(|e| Reject::Bad(e.to_string()))?;
         let mut guard = lock(&entry);
@@ -315,6 +332,41 @@ impl Receiver {
                 "replica page size is {replica_page_size}, batch says {page_size}"
             )));
         }
+        // A batch from a generation before the replica's is never applied, so
+        // it is answered with the replica's position before its frames are
+        // looked at. The shipper reads that as "send a base". It also leaves
+        // an open session alone, since that session belongs to a newer sender.
+        if generation < r.generation {
+            let db = r.db.as_ref().expect("opened above");
+            let frames = match db.head(BUSY_TIMEOUT) {
+                Ok(Some(n)) => n,
+                Ok(None) => return Err(Reject::Busy),
+                Err(e) => return Err(needs_base(e)),
+            };
+            return Err(Reject::Mismatch {
+                generation: r.generation,
+                frames,
+            });
+        }
+        let mut big_endian = check_batch(body, frame_len)?;
+        // A batch that picks up right after the last frame applied also has
+        // its first frame checked, against that frame.
+        if let Some(t) = r
+            .tail
+            .filter(|t| t.generation == generation && t.no + 1 == first)
+        {
+            let ok = t.salt == wal::frame_salt(first_frame)
+                && wal::chain_checksum(t.checksum, first_frame, t.big_endian)
+                    == wal::frame_checksum(first_frame);
+            if !ok {
+                return Err(Reject::Bad(format!(
+                    "frame {first} doesn't follow frame {} (salt or checksum)",
+                    t.no
+                )));
+            }
+            big_endian = Some(t.big_endian);
+        }
+
         let db = r.db.as_ref().expect("opened above");
 
         let continues_session = r.pending == Some(first) && r.generation == generation;
@@ -369,7 +421,11 @@ impl Receiver {
             }
             if wal::size_after(frame) > 0 {
                 if let Err(e) = db.insert_end() {
+                    // Everything up to the previous commit frame is in; this
+                    // transaction may or may not be.
                     r.pending = None;
+                    r.committed = committed;
+                    r.tail = None;
                     return Err(needs_base(e));
                 }
                 in_session = false;
@@ -379,6 +435,14 @@ impl Receiver {
         }
         r.pending = in_session.then_some(no);
         r.committed = committed;
+        let last = &body[body.len() - frame_len..];
+        r.tail = big_endian.map(|big_endian| Tail {
+            generation,
+            no: no - 1,
+            salt: wal::frame_salt(last),
+            checksum: wal::frame_checksum(last),
+            big_endian,
+        });
         Ok(self.status_of(name, r))
     }
 
@@ -489,6 +553,7 @@ impl Receiver {
         let _ = std::fs::remove_file(self.state_path(name));
         r.generation = 0;
         r.committed = 0;
+        r.tail = None;
         Ok(std::mem::take(&mut r.present))
     }
 }
@@ -555,6 +620,60 @@ fn check_base(path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Checks a batch on its own, before any of it is applied: every frame names
+/// a real page, carries the same salt, and chains its checksum from the frame
+/// before it the way SQLite wrote it; and no frame names a page past the
+/// database size its transaction's commit frame gives. A frame damaged in
+/// transit, or a batch put together wrong, is refused instead of landing in
+/// the replica.
+///
+/// Returns the checksum byte order the batch was written in, or `None` for a
+/// one-frame batch, which has nothing inside it to chain.
+fn check_batch(body: &[u8], frame_len: usize) -> Result<Option<bool>, Reject> {
+    let frames: Vec<&[u8]> = body.chunks_exact(frame_len).collect();
+    let salt = wal::frame_salt(frames[0]);
+    let mut big_endian = None;
+    let mut txn_max = 0u32;
+    for (i, frame) in frames.iter().enumerate() {
+        let pgno = wal::page_no(frame);
+        if pgno == 0 {
+            return Err(Reject::Bad(format!("frame {i} of the batch names page 0")));
+        }
+        if wal::frame_salt(frame) != salt {
+            return Err(Reject::Bad(format!(
+                "frame {i} of the batch has a different salt"
+            )));
+        }
+        txn_max = txn_max.max(pgno);
+        let size = wal::size_after(frame);
+        if size > 0 {
+            if txn_max > size {
+                return Err(Reject::Bad(format!(
+                    "frame {i} of the batch commits a {size}-page database but its transaction writes page {txn_max}"
+                )));
+            }
+            txn_max = 0;
+        }
+        if i == 0 {
+            continue;
+        }
+        let prev = wal::frame_checksum(frames[i - 1]);
+        let want = wal::frame_checksum(frame);
+        let order = match big_endian {
+            Some(order) => order,
+            None if wal::chain_checksum(prev, frame, false) == want => false,
+            None => true,
+        };
+        if wal::chain_checksum(prev, frame, order) != want {
+            return Err(Reject::Bad(format!(
+                "frame {i} of the batch fails its checksum"
+            )));
+        }
+        big_endian = Some(order);
+    }
+    Ok(big_endian)
 }
 
 #[cfg(test)]
@@ -693,6 +812,67 @@ mod tests {
         assert!(rx.status("x").is_none());
         assert!(!rx.db_path("x").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_frames_are_refused_and_leave_the_replica_alone() {
+        let dir = scratch("damaged");
+        let src = RawDb::open(&dir.join("src.db"), BUSY_TIMEOUT).unwrap();
+        src.disable_checkpoint().unwrap();
+        let ps = src.page_size().unwrap();
+        let rx = Receiver::new(dir.join("replicas")).unwrap();
+        let staged = rx.staging_path("x");
+        std::fs::write(&staged, b"").unwrap();
+        rx.install_base("x", &staged, 1).unwrap();
+
+        src.exec("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        src.exec("INSERT INTO t(v) VALUES ('a'),('b')").unwrap();
+        let head = src.head(BUSY_TIMEOUT).unwrap().unwrap();
+        assert!(head >= 2, "need at least two frames, got {head}");
+        let good = frames(&src, 1, head, ps);
+        let flen = wal::FRAME_HEADER + ps as usize;
+        let bad = |what: &str, edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut b = good.clone();
+            edit(&mut b);
+            let got = rx.apply_frames("x", 1, 1, ps, &b);
+            assert!(matches!(got, Err(Reject::Bad(_))), "{what}: {got:?}");
+        };
+        // A flipped byte in the second frame's page.
+        bad("page byte", &|b| b[flen + wal::FRAME_HEADER + 100] ^= 1);
+        // A second frame from some other log.
+        bad("salt", &|b| b[flen + 8] ^= 1);
+        // Page 0 isn't a page.
+        bad("page 0", &|b| {
+            b[flen..flen + 4].copy_from_slice(&0u32.to_be_bytes())
+        });
+        // A commit frame whose size is smaller than a page its transaction wrote.
+        bad("commit size", &|b| {
+            let last = b.len() - flen;
+            b[last..last + 4].copy_from_slice(&999u32.to_be_bytes());
+        });
+        assert_eq!(rx.status("x").unwrap().frames, 0);
+
+        // The undamaged batch still goes in.
+        let s = rx.apply_frames("x", 1, 1, ps, &good).unwrap();
+        assert_eq!(s.frames, head);
+
+        // The next batch is checked against the frame before it, so damage to
+        // its first frame is refused too.
+        src.exec("INSERT INTO t(v) VALUES ('c')").unwrap();
+        let head2 = src.head(BUSY_TIMEOUT).unwrap().unwrap();
+        let mut next = frames(&src, head + 1, head2, ps);
+        next[wal::FRAME_HEADER + 50] ^= 1;
+        assert!(matches!(
+            rx.apply_frames("x", 1, head + 1, ps, &next),
+            Err(Reject::Bad(_))
+        ));
+        next[wal::FRAME_HEADER + 50] ^= 1;
+        assert_eq!(
+            rx.apply_frames("x", 1, head + 1, ps, &next).unwrap().frames,
+            head2
+        );
+        assert_eq!(rows(&read_only(&rx.db_path("x"))), 3);
     }
 
     #[test]

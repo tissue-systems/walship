@@ -31,7 +31,7 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
 
 use crate::{
     proto::{Deleted, Refusal, ReplicaInfo, ReplicaList},
@@ -43,6 +43,11 @@ use crate::{
 /// which is 32 MiB at the largest page size.
 const MAX_FRAMES_BODY: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_BASE: u64 = 8 * 1024 * 1024 * 1024;
+/// How many base uploads may stream at once. Each one fills disk.
+const DEFAULT_BASE_SLOTS: usize = 2;
+/// How many frames requests may be in flight at once. Each one holds its
+/// whole body (up to [`MAX_FRAMES_BODY`]) in memory.
+const DEFAULT_FRAMES_SLOTS: usize = 8;
 
 /// Builds the router. See the [module docs](self).
 #[derive(Debug)]
@@ -50,6 +55,8 @@ pub struct Routes {
     receiver: Arc<Receiver>,
     token: Option<String>,
     max_base_bytes: u64,
+    base_slots: usize,
+    frames_slots: usize,
 }
 
 impl Routes {
@@ -60,6 +67,8 @@ impl Routes {
             receiver,
             token: None,
             max_base_bytes: DEFAULT_MAX_BASE,
+            base_slots: DEFAULT_BASE_SLOTS,
+            frames_slots: DEFAULT_FRAMES_SLOTS,
         }
     }
 
@@ -80,20 +89,45 @@ impl Routes {
         self
     }
 
+    /// How many base uploads and frames requests may run at once (defaults
+    /// 2 and 8). A request past the limit gets 503 straight away, before its
+    /// body is read, and the shipper retries it after a back-off. This bounds
+    /// the memory and disk a flood of uploads can take, token or not.
+    ///
+    /// # Panics
+    ///
+    /// If either limit is 0.
+    #[must_use]
+    pub fn concurrency(mut self, base: usize, frames: usize) -> Self {
+        assert!(
+            base > 0 && frames > 0,
+            "concurrency limits must be at least 1"
+        );
+        self.base_slots = base;
+        self.frames_slots = frames;
+        self
+    }
+
     /// Builds the axum router. It has its own state, so it can be merged or
     /// nested into a router of any state type.
     pub fn into_router(self) -> Router {
+        let base_slots = Arc::new(Semaphore::new(self.base_slots));
+        let frames_slots = Arc::new(Semaphore::new(self.frames_slots));
         let state = Arc::new(self);
         Router::new()
             .route("/replica", get(list))
             .route("/replica/{name}", get(status).delete(delete))
             .route(
                 "/replica/{name}/base",
-                post(base).layer(DefaultBodyLimit::disable()),
+                post(base)
+                    .layer(DefaultBodyLimit::disable())
+                    .layer(middleware::from_fn_with_state(base_slots, limit)),
             )
             .route(
                 "/replica/{name}/frames",
-                post(frames).layer(DefaultBodyLimit::max(MAX_FRAMES_BODY)),
+                post(frames)
+                    .layer(DefaultBodyLimit::max(MAX_FRAMES_BODY))
+                    .layer(middleware::from_fn_with_state(frames_slots, limit)),
             )
             .layer(middleware::from_fn_with_state(Arc::clone(&state), auth))
             .with_state(state)
@@ -148,6 +182,16 @@ async fn auth(State(routes): AppState, req: Request, next: Next) -> Response {
             return Refused::new(StatusCode::UNAUTHORIZED, "bad or missing token").into_response();
         }
     }
+    next.run(req).await
+}
+
+/// Lets a request through only while a slot is free, holding the slot until
+/// the response is built. Runs before the body is read.
+async fn limit(State(slots): State<Arc<Semaphore>>, req: Request, next: Next) -> Response {
+    let Ok(_slot) = slots.try_acquire_owned() else {
+        return Refused::new(StatusCode::SERVICE_UNAVAILABLE, "busy, try again shortly")
+            .into_response();
+    };
     next.run(req).await
 }
 
