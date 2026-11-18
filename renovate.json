@@ -1,0 +1,16 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "description": "walship is a library, so its Cargo.toml keeps version ranges, dev-dependencies included. An exact pin there stops cargo from picking one version that every crate in a build agrees on.",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "replace"
+    },
+    {
+      "description": "libsql, libsql-ffi and libsql-sys move together and only when a person asks. Each libsql-ffi minor is its own SQLite C library, and cargo refuses two in one build: walship on 0.10 can't be used by cell while cell's vendored libsql is on 0.9. Tick the box on the dependency dashboard once cell is ready.",
+      "matchPackageNames": ["libsql", "libsql-ffi", "libsql-sys"],
+      "groupName": "libsql",
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
