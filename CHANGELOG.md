@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 (2026-11-18)
 
 The receiver checks every batch before applying any of it. Each frame has to
 name a real page, carry the same salt as the rest of the batch, and chain its
